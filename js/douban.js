@@ -495,8 +495,8 @@ function renderDoubanCards(data, container) {
             // 1. 直接使用豆瓣图片URL (添加no-referrer属性)
             const originalCoverUrl = item.cover;
             
-            // 2. 也准备代理URL作为备选
-            const proxiedCoverUrl = PROXY_URL + encodeURIComponent(originalCoverUrl);
+            // 2. 使用新缓存地址，避开旧代理可能已缓存的损坏图片；参数不会传给上游。
+            const proxiedCoverUrl = PROXY_URL + encodeURIComponent(originalCoverUrl) + '?image-proxy=v2';
             
             // 为不同设备优化卡片布局
             card.innerHTML = `

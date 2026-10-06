@@ -172,6 +172,12 @@ export async function onRequest(context) {
         return `/proxy/${encodeURIComponent(targetUrl)}`;
     }
 
+    // 图片不能经过 UTF-8 文本解码；无扩展名的图片以响应类型识别。
+    function isImageResource(targetUrl, contentType = '') {
+        return contentType.toLowerCase().startsWith('image/') ||
+            /\.(?:jpe?g|png|gif|webp|bmp|tiff?|svg|avif|heic)$/i.test(new URL(targetUrl).pathname);
+    }
+
     // 获取远程内容及其类型
     async function fetchContentWithType(targetUrl) {
         const headers = new Headers({
@@ -195,9 +201,15 @@ export async function onRequest(context) {
                  throw new Error(`HTTP error ${response.status}: ${response.statusText}. URL: ${targetUrl}. Body: ${errorBody.substring(0, 150)}`);
             }
 
-            // 读取响应内容为文本
-            const content = await response.text();
             const contentType = response.headers.get('Content-Type') || '';
+            if (isImageResource(targetUrl, contentType)) {
+                // 保持流及 Content-Encoding 配套，既不破坏二进制，也不整张读入内存。
+                return { content: response.body, contentType, responseHeaders: response.headers,
+                    status: response.status, isImage: true };
+            }
+
+            // JSON、字幕与播放清单仍沿用文本处理。
+            const content = await response.text();
             logDebug(`请求成功: ${targetUrl}, Content-Type: ${contentType}, 内容长度: ${content.length}`);
             return { content, contentType, responseHeaders: response.headers }; // 同时返回原始响应头
 
@@ -436,7 +448,7 @@ export async function onRequest(context) {
             kvNamespace = null;
         }
 
-        if (kvNamespace) {
+        if (kvNamespace && !isImageResource(targetUrl)) {
             try {
                 const cachedDataJson = await kvNamespace.get(cacheKey); // 直接获取字符串
                 if (cachedDataJson) {
@@ -447,7 +459,10 @@ export async function onRequest(context) {
                     try { headers = JSON.parse(cachedData.headers); } catch(e){} // 解析头部
                     const contentType = headers['content-type'] || headers['Content-Type'] || '';
 
-                    if (isM3u8Content(content, contentType)) {
+                    if (isImageResource(targetUrl, contentType)) {
+                        // 旧版 KV 中的图片已经被转成字符串，无法还原，必须重新获取。
+                        logDebug(`忽略旧图片文本缓存: ${targetUrl}`);
+                    } else if (isM3u8Content(content, contentType)) {
                         logDebug(`缓存内容是 M3U8，重新处理: ${targetUrl}`);
                         const processedM3u8 = await processM3u8Content(targetUrl, content, 0, env);
                         return createM3u8Response(processedM3u8);
@@ -465,7 +480,14 @@ export async function onRequest(context) {
         }
 
         // --- 实际请求 ---
-        const { content, contentType, responseHeaders } = await fetchContentWithType(targetUrl);
+        const { content, contentType, responseHeaders, status, isImage } = await fetchContentWithType(targetUrl);
+
+        if (isImage) {
+            const imageHeaders = new Headers(responseHeaders);
+            imageHeaders.set('Cache-Control', `public, max-age=${CACHE_TTL}`);
+            // 由浏览器 / CDN 缓存原始图片，不写入只支持文本内容的旧 KV 格式。
+            return createResponse(content, status, imageHeaders);
+        }
 
         // --- 写入缓存 (KV) ---
         if (kvNamespace) {
