@@ -1,4 +1,5 @@
 import dns from 'node:dns/promises';
+import { isIP } from 'node:net';
 
 /** 去掉 URL.hostname 对 IPv6 附加的方括号（"[::1]" → "::1"） */
 function stripBrackets(host: string): string {
@@ -24,6 +25,21 @@ function toIPv4(ip: string): string | null {
 export function isPrivateIP(ip: string): boolean {
   let v = stripBrackets(ip.trim());
   v = toIPv4(v) ?? v;
+  const family = isIP(v);
+  if (!family) return true; // 无法识别的解析结果不得视为公网。
+  if (family === 4) {
+    const [a, b, c] = v.split('.').map(Number);
+    if (a === 0 || a >= 224 || a === 127 || a === 10) return true;
+    if (a === 100 && b >= 64 && b <= 127) return true;
+    if (a === 198 && (b === 18 || b === 19 || (b === 51 && c === 100))) return true;
+    if (a === 192 && b === 0 && (c === 0 || c === 2)) return true;
+    if (a === 203 && b === 0 && c === 113) return true;
+  } else {
+    // URL 规范化压缩/全写 IPv6；只接受全球单播，拒绝特殊用途与文档网段。
+    v = new URL('http://[' + v + ']/').hostname.slice(1, -1).toLowerCase();
+    const first = parseInt(v.split(':')[0], 16);
+    if ((first & 0xe000) !== 0x2000 || /^2001:(?:db8|[01]?[0-9a-f]{1,2}):/.test(v) || v.startsWith('3fff:')) return true;
+  }
   if (/^(127\.|0\.0\.0\.0$|::1$|::$|fe80:|fc|fd)/i.test(v)) return true;
   if (v.startsWith('10.')) return true;
   if (v.startsWith('192.168.')) return true;
@@ -52,17 +68,97 @@ export function isValidProxyUrl(urlString: string): boolean {
   }
 }
 
-/** DNS 解析后校验目标主机名是否解析到内网/保留地址 */
+/**
+ * workerd resolve4/resolve6 currently collapse NODATA and other missing-answer
+ * responses into ENOTFOUND. Read the DoH status directly to distinguish them.
+ * The resolver is fixed, redirects are forbidden, and its body is bounded.
+ */
+async function resolveWorkersFamily(hostname: string, family: 4 | 6): Promise<string[]> {
+  const type = family === 4 ? 1 : 28;
+  const query = new URL('https://cloudflare-dns.com/dns-query');
+  query.searchParams.set('name', hostname);
+  query.searchParams.set('type', family === 4 ? 'A' : 'AAAA');
+  const response = await fetch(query, {
+    headers: { Accept: 'application/dns-json' },
+    redirect: 'manual', signal: AbortSignal.timeout(3000),
+  });
+  if (!response.ok || !response.body) {
+    await response.body?.cancel();
+    throw new Error('DNS resolver unavailable');
+  }
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > 65536) throw new Error('DNS response too large');
+      chunks.push(value);
+    }
+  } catch (error) {
+    await reader.cancel().catch(() => {});
+    throw error;
+  } finally { reader.releaseLock(); }
+  const data = JSON.parse(Buffer.concat(chunks, bytes).toString('utf8'));
+  const question = data?.Question?.[0];
+  if (data?.Status !== 0 || data.TC !== false || data.Question?.length !== 1 ||
+      question?.type !== type || typeof question?.name !== 'string' ||
+      question.name.toLowerCase().replace(/\.$/, '') !== hostname.toLowerCase().replace(/\.$/, '')) {
+    throw new Error('DNS query failed or returned an unverifiable response');
+  }
+  // NOERROR without answers is NODATA; NXDOMAIN/SERVFAIL/REFUSED were rejected.
+  if (data.Answer === undefined) return [];
+  if (!Array.isArray(data.Answer) || data.Answer.length > 64) throw new Error('Invalid DNS answers');
+  const addresses: string[] = [];
+  for (const answer of data.Answer) {
+    if (answer?.type === 5 && typeof answer.data === 'string') continue; // CNAME
+    if (answer?.type !== type || typeof answer.data !== 'string' || isIP(answer.data) !== family) {
+      throw new Error('Invalid DNS address');
+    }
+    addresses.push(answer.data);
+  }
+  return addresses;
+}
+
+/** Node ENODATA only means this record family is absent; other errors fail closed. */
+async function resolveFamily(hostname: string, family: 4 | 6): Promise<string[]> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const records = await Promise.race([
+      typeof navigator !== 'undefined' && navigator.userAgent === 'Cloudflare-Workers'
+        ? resolveWorkersFamily(hostname, family)
+        : family === 4 ? dns.resolve4(hostname) : dns.resolve6(hostname),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error('DNS query timed out')), 3000);
+      }),
+    ]);
+    if (records.length > 64 || records.some((address) => isIP(address) !== family)) {
+      throw new Error('Invalid DNS response');
+    }
+    return records;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === 'ENODATA') return [];
+    throw error;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/** DNS 失败、空结果或任一地址无法验证均拒绝；预检查仍无法固定 fetch 的 DNS 结果。 */
 export async function isBlockedByDNS(urlString: string): Promise<boolean> {
   try {
     const hostname = stripBrackets(new URL(urlString).hostname);
     if (/^\d{1,3}(\.\d{1,3}){3}$/.test(hostname) || hostname.includes(':')) {
       return isPrivateIP(hostname);
     }
-    const result = await dns.lookup(hostname, { all: true });
-    return result.some((r) => isPrivateIP(r.address));
+    const results = await Promise.allSettled([resolveFamily(hostname, 4), resolveFamily(hostname, 6)]);
+    if (results.some((result) => result.status === 'rejected')) return true;
+    const addresses = results.flatMap((result) => result.status === 'fulfilled' ? result.value : []);
+    return addresses.length === 0 || addresses.some(isPrivateIP);
   } catch {
-    return false; // 解析失败不阻断，交给后续请求处理
+    return true;
   }
 }
 
@@ -79,7 +175,7 @@ export async function checkUpstreamAllowed(urlString: string): Promise<UpstreamV
     return { ok: false, reason: '目标地址不在允许范围内（仅支持公网 http/https）' };
   }
   if (await isBlockedByDNS(urlString)) {
-    return { ok: false, reason: '目标地址解析到私有/保留网络' };
+    return { ok: false, reason: '目标地址解析到私有/保留网络，或 DNS 无法安全验证' };
   }
   return { ok: true };
 }

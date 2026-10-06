@@ -12,3 +12,8 @@ vitest-results.json
 .zcode/
 .codebuddy/
 generated-images/
+/dist/
+.vinext/
+.cloudflare/
+.dev.vars
+.dev.vars.*

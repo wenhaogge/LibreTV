@@ -76,16 +76,24 @@ export function sessionFromCookieHeader(cookieHeader: string | null): boolean {
   return false;
 }
 
-// —— 登录速率限制（内存实现，单实例部署足够；多实例可换 Redis） ——
+// —— 登录速率限制（内存实现，仅当前实例有效） ——
 
 const attemptMap = new Map<string, { count: number; resetAt: number }>();
 const MAX_ATTEMPTS = 10;
 const WINDOW_MS = 10 * 60 * 1000;
+const MAX_RECORDS = 4096;
 
 export function checkRateLimit(ip: string): boolean {
   const now = Date.now();
+  // 请求触发清理；无需在 Worker 模块加载时启动后台定时器。
+  for (const [key, value] of attemptMap) {
+    if (now >= value.resetAt) attemptMap.delete(key);
+  }
+  if (ip.length > 256) return false;
   const entry = attemptMap.get(ip);
-  if (!entry || now > entry.resetAt) {
+  if (!entry) {
+    // 不逐出仍有效的限流记录，否则换 IP 可挤掉其他用户的计数。
+    if (attemptMap.size >= MAX_RECORDS) return false;
     attemptMap.set(ip, { count: 1, resetAt: now + WINDOW_MS });
     return true;
   }
@@ -98,14 +106,4 @@ export function clearRateLimit(ip: string): void {
   attemptMap.delete(ip);
 }
 
-// 定期清理过期限流记录，避免长期运行下 Map 膨胀
-if (typeof setInterval === 'function') {
-  const timer = setInterval(() => {
-    const now = Date.now();
-    for (const [ip, entry] of attemptMap) {
-      if (now > entry.resetAt) attemptMap.delete(ip);
-    }
-  }, 60 * 1000);
-  // 不阻止 Node 进程退出
-  if (typeof timer.unref === 'function') timer.unref();
-}
+// 此限流仅对当前实例有效，不是跨实例的全局限流。

@@ -1,12 +1,12 @@
 import { gunzipSync } from 'node:zlib';
 import type { EpgProgram } from './types';
+import { EpgLimitError, getEpgLimits } from './epg-limits';
 
 /**
  * XMLTV 节目单解析。
  *
- * XMLTV 文件常达数十 MB，这里不做完整 DOM 解析，而是单趟正则扫描
- * `<programme ...>` 节点，解析后按频道索引、按时间窗裁剪并丢弃原始文本，
- * 避免内存中同时持有原始 XML 与解析结果。
+ * 在有大小上限的文本上单趟扫描 `<programme ...>`，按频道与时间窗索引。
+ * 解析时仍同时持有输入、解压文本和结果；估算预算不代表进程总内存上限。
  *
  * 时间格式：`20240101120000 +0800`（秒可带毫秒小数，时区可省略或为 Z / ±hhmm）。
  */
@@ -77,14 +77,30 @@ export function parseXmltv(
   windowMs: number = DEFAULT_WINDOW_MS,
   now: number = Date.now()
 ): Map<string, EpgProgram[]> {
+  const limits = getEpgLimits();
+  if (Buffer.byteLength(content) > limits.inputBytes) {
+    throw new EpgLimitError('节目单超过输入大小上限');
+  }
   let text: string;
   if (Buffer.isBuffer(content)) {
-    text =
-      content.length >= 2 && content[0] === 0x1f && content[1] === 0x8b
-        ? gunzipSync(content).toString('utf8')
-        : content.toString('utf8');
+    if (content.length >= 2 && content[0] === 0x1f && content[1] === 0x8b) {
+      try {
+        // zlib 在解压过程中限制输出，不先分配无限输出后再检查。
+        text = gunzipSync(content, { maxOutputLength: limits.outputBytes }).toString('utf8');
+      } catch (error) {
+        // workerd's bounded zlib buffer uses RangeError without Node's code.
+        if ((error as NodeJS.ErrnoException).code === 'ERR_BUFFER_TOO_LARGE' ||
+            (error instanceof RangeError && error.message === 'Memory limit exceeded')) {
+          throw new EpgLimitError('节目单解压输出超过大小上限');
+        }
+        throw error;
+      }
+    } else text = content.toString('utf8');
   } else {
     text = content;
+  }
+  if (Buffer.byteLength(text) > limits.outputBytes) {
+    throw new EpgLimitError('节目单解压输出超过大小上限');
   }
 
   const result = new Map<string, EpgProgram[]>();
@@ -92,7 +108,11 @@ export function parseXmltv(
 
   PROGRAMME_RE.lastIndex = 0;
   let m: RegExpExecArray | null;
+  let scanned = 0;
+  let retained = 0;
+  let estimatedBytes = 0;
   while ((m = PROGRAMME_RE.exec(text))) {
+    if (++scanned > limits.scannedProgrammes) throw new EpgLimitError('节目单扫描节目数量超限');
     const attrText = m[1] ?? m[2] ?? '';
     const inner = m[3] ?? '';
     const attrs = extractAttrs(attrText);
@@ -114,6 +134,16 @@ export function parseXmltv(
     };
     if (descMatch) program.desc = decodeXmlText(descMatch[1]);
     if (!program.title) continue;
+    if ([channelId, program.title, program.desc ?? ''].some((field) => field.length > limits.fieldChars)) {
+      throw new EpgLimitError('节目单字段长度超限');
+    }
+    estimatedBytes += estimateProgrammeBytes(program) + (result.has(channelId) ? 0 : 128);
+    if (++retained > limits.programmes || estimatedBytes > limits.parsedBytes) {
+      throw new EpgLimitError('节目单解析结果超限');
+    }
+    if (!result.has(channelId) && result.size >= limits.channels) {
+      throw new EpgLimitError('节目单频道数量超限');
+    }
 
     const list = result.get(channelId);
     if (list) list.push(program);
@@ -123,6 +153,15 @@ export function parseXmltv(
   // 按开播时间排序（XMLTV 不保证顺序）
   for (const list of result.values()) list.sort((a, b) => a.start - b.start);
   return result;
+}
+
+function estimateProgrammeBytes(program: EpgProgram): number {
+  return 256 + 2 * (program.channelId.length + program.title.length + (program.desc?.length ?? 0));
+}
+export function estimateXmltvBytes(programmes: Map<string, EpgProgram[]>): number {
+  let total = programmes.size * 128;
+  for (const list of programmes.values()) for (const programme of list) total += estimateProgrammeBytes(programme);
+  return total;
 }
 
 /** 取某频道当前正在播出的节目与下一个节目 */

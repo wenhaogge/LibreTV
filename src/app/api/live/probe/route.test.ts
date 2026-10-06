@@ -2,6 +2,15 @@ import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { POST } from './route';
 import { SESSION_COOKIE, signSession } from '@/lib/auth';
 
+// Fixtures use .test domains and mocked fetch, so supply explicit public DNS
+// answers rather than relying on the old fail-open behavior on lookup failure.
+vi.mock('node:dns/promises', () => ({
+  default: {
+    resolve4: vi.fn(async () => ['93.184.216.34']),
+    resolve6: vi.fn(async () => []),
+  },
+}));
+
 /**
  * 测活接口单测：流式 NDJSON、codec 解析、内容校验、结果缓存、内网放行。
  * 上游一律用 mock fetch，不产生真实网络请求。

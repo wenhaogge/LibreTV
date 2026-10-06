@@ -2,6 +2,15 @@ import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { POST } from './route';
 import { SESSION_COOKIE, signSession } from '@/lib/auth';
 
+// These tests mock fetch for .example domains; DNS must be controlled as well
+// now that unresolvable names are rejected instead of implicitly allowed.
+vi.mock('node:dns/promises', () => ({
+  default: {
+    resolve4: vi.fn(async () => ['93.184.216.34']),
+    resolve6: vi.fn(async () => []),
+  },
+}));
+
 /**
  * 聚合搜索接口单测：跨源聚合、同源去重、精确命中置顶、成人内容过滤、
  * 失败源不影响整体、SSRF 字面量拒绝。上游一律 mock fetch，无真实网络。

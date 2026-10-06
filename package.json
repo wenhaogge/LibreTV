@@ -9,12 +9,18 @@
     "build": "next build",
     "start": "next start -p 8080",
     "lint": "eslint src",
-    "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "typecheck": "next typegen && tsc --noEmit",
+    "test": "vitest run",
+    "dev:vinext": "vite dev --port 3001",
+    "build:vinext": "vite build",
+    "start:vinext": "vite preview --host 127.0.0.1 --port 4173",
+    "preview:vinext": "vite preview --host 127.0.0.1 --port 4173",
+    "test:workers": "node scripts/workers-integration.mjs"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.59.0",
     "@tanstack/react-virtual": "^3.14.12",
+    "@vinext/cloudflare": "1.0.1",
     "artplayer": "^5.2.3",
     "dexie": "^4.0.8",
     "dexie-react-hooks": "^1.1.7",
@@ -24,18 +30,33 @@
     "next": "^15.1.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
+    "react-server-dom-webpack": "19.3.0",
+    "vinext": "1.0.1",
     "zustand": "^5.0.2"
   },
   "devDependencies": {
+    "@cloudflare/vite-plugin": "2.0.0-beta.sha-52b0dc0e9",
     "@types/node": "^22.10.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "6.1.2",
+    "@vitejs/plugin-rsc": "0.5.35",
     "autoprefixer": "^10.4.20",
+    "cf": "1.0.0-beta.12",
     "eslint": "^9.39.4",
     "eslint-config-next": "^15.5.25",
+    "miniflare": "5.20260930.0-alpha",
     "postcss": "^8.4.49",
     "tailwindcss": "^3.4.15",
     "typescript": "^5.7.2",
-    "vitest": "^2.1.8"
+    "vite": "8.3.0",
+    "vitest": "5.0.3"
+  },
+  "type": "module",
+  "overrides": {
+    "postcss@8.4.31": "8.5.29",
+    "satori@0.33.5": {
+      "fflate": "0.7.5"
+    }
   }
 }

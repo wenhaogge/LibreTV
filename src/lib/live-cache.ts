@@ -6,6 +6,8 @@
  * 这里独立实例 + 按字节数与条目数双重上限，超限逐出最旧条目。
  */
 
+import { getEpgLimits } from './epg-limits';
+
 interface Entry {
   value: unknown;
   expiresAt: number;
@@ -13,39 +15,39 @@ interface Entry {
   bytes: number;
 }
 
-const MAX_ENTRIES = 10;
-const MAX_TOTAL_BYTES = 256 * 1024 * 1024; // 256MB
-
 const store = new Map<string, Entry>();
 
 export function getLiveCache<T>(key: string): T | undefined {
   const entry = store.get(key);
   if (!entry) return undefined;
-  if (Date.now() > entry.expiresAt) {
+  if (Date.now() >= entry.expiresAt) {
     store.delete(key);
     return undefined;
   }
   return entry.value as T;
 }
 
-export function setLiveCache(key: string, value: unknown, ttlMs: number, sizeHint?: number): void {
+export function setLiveCache(key: string, value: unknown, ttlMs: number, sizeHint?: number): boolean {
   const now = Date.now();
+  const { cacheBytes, cacheEntries } = getEpgLimits();
   const bytes = Math.max(sizeHint ?? 0, 64 * 1024);
+  store.delete(key);
+  if (!Number.isFinite(bytes) || bytes > cacheBytes || ttlMs <= 0) return false;
 
   // 先清理已过期条目
   for (const [k, v] of store) {
-    if (now > v.expiresAt) store.delete(k);
+    if (now >= v.expiresAt) store.delete(k);
   }
 
   // 容量上限：逐出最旧写入的条目（Map 迭代序即插入序）
-  while (store.size >= MAX_ENTRIES) {
+  while (store.size >= cacheEntries) {
     const oldest = store.keys().next().value;
     if (oldest === undefined) break;
     store.delete(oldest);
   }
   let total = 0;
   for (const v of store.values()) total += v.bytes;
-  while (total + bytes > MAX_TOTAL_BYTES && store.size > 0) {
+  while (total + bytes > cacheBytes && store.size > 0) {
     const oldest = store.keys().next().value;
     if (oldest === undefined) break;
     total -= store.get(oldest)!.bytes;
@@ -53,4 +55,5 @@ export function setLiveCache(key: string, value: unknown, ttlMs: number, sizeHin
   }
 
   store.set(key, { value, expiresAt: now + ttlMs, bytes });
+  return true;
 }

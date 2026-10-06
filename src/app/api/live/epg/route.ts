@@ -3,7 +3,8 @@ import { guardRequest, jsonError } from '@/lib/api-guard';
 import { checkLiveUrlAllowed } from '@/lib/ssrf';
 import { fetchUpstream } from '@/lib/fetch-utils';
 import { getLiveCache, setLiveCache } from '@/lib/live-cache';
-import { currentAndNext, parseXmltv } from '@/lib/xmltv';
+import { currentAndNext, estimateXmltvBytes, parseXmltv } from '@/lib/xmltv';
+import { acquireEpgSlot, EpgLimitError, readEpgBody } from '@/lib/epg-limits';
 import type { EpgProgram } from '@/lib/types';
 
 export const runtime = 'nodejs';
@@ -37,17 +38,23 @@ export async function GET(req: Request) {
   const key = `live:epg:${url}`;
   let programMap: Map<string, EpgProgram[]> | undefined = force ? undefined : getLiveCache(key);
   if (!programMap) {
+    const release = acquireEpgSlot();
+    if (!release) return jsonError('节目单处理繁忙，已达到并发上限，请稍后重试', 503);
     try {
       const res = await fetchUpstream(url, { timeoutMs: FETCH_TIMEOUT_MS, retries: 0, allowPrivate: true });
       if (!res.ok) {
+        await res.body?.cancel();
         return jsonError(`节目单地址请求失败: ${res.status}`, 502);
       }
       // gzip 由 parseXmltv 内识别（fetch 对 .gz 不会自动解压）
-      const buf = Buffer.from(await res.arrayBuffer());
+      const buf = await readEpgBody(res);
       programMap = parseXmltv(buf, WINDOW_MS);
-      setLiveCache(key, programMap, CACHE_TTL_MS, buf.byteLength * 2);
+      setLiveCache(key, programMap, CACHE_TTL_MS, estimateXmltvBytes(programMap));
     } catch (err) {
+      if (err instanceof EpgLimitError) return jsonError(err.message, 413);
       return jsonError(`节目单地址请求失败: ${err instanceof Error ? err.message : '未知错误'}`, 502);
+    } finally {
+      release();
     }
   }
 
